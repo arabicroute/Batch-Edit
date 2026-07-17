@@ -9,9 +9,20 @@ from PyQt5 import QtWidgets
 
 import operations  # noqa: F401
 from config.config_manager import ConfigManager
-from core.engines import EngineUnavailableError, get_runtime_status, select_engine
+from core.engines import (
+    DocxEngine,
+    EngineUnavailableError,
+    get_runtime_status,
+    select_engine,
+)
 from core.operations import OperationRegistry, OperationValidationError
 from core.pipeline import Pipeline, PipelineExecutionWorker
+from ui.operation_forms import (
+    ArabicRtlNormalizeFormDialog,
+    FindReplaceFormDialog,
+    TocBuilderFormDialog,
+)
+from ui.operation_picker_dialog import OperationPickerDialog
 from ui.tabs_config import ConfigTab
 from ui.tabs_pipeline import OperationParamsDialog, PipelineTab
 
@@ -514,6 +525,54 @@ class MainWindow(QtWidgets.QMainWindow):
             return [{"style_name": paragraph_styles[0].name, "level": 1}]
         return [{"style_name": "Heading 1", "level": 1}]
 
+    def _build_operation_dialog(
+        self,
+        display_name: str,
+        initial_params: dict,
+    ) -> QtWidgets.QDialog:
+        """Stage 2 of Add/Edit Operation: build the right form for the type.
+
+        Falls back to the generic JSON editor (OperationParamsDialog) for any
+        operation type without a dedicated guided form yet, so adding a new
+        operation type later never breaks the Add Operation flow.
+        """
+        is_docx_engine = isinstance(self.current_engine, DocxEngine)
+        capabilities = set(getattr(self.current_engine, "capabilities", set()))
+
+        if display_name == "Find/Replace":
+            return FindReplaceFormDialog(
+                initial_params=initial_params,
+                is_docx_engine=is_docx_engine,
+                engine_capabilities=capabilities,
+                parent=self,
+            )
+        if display_name == "Arabic RTL Normalize":
+            return ArabicRtlNormalizeFormDialog(
+                initial_params=initial_params,
+                is_docx_engine=is_docx_engine,
+                engine_capabilities=capabilities,
+                parent=self,
+            )
+        if display_name == "Custom TOC Builder":
+            paragraph_style_names = [
+                style.name
+                for style in self.current_style_catalog.get("paragraph_styles", [])
+            ]
+            return TocBuilderFormDialog(
+                initial_params=initial_params,
+                paragraph_style_names=paragraph_style_names,
+                parent=self,
+            )
+
+        schema = OperationRegistry.get(display_name).operation_cls.params_schema
+        return OperationParamsDialog(
+            operation_name=display_name,
+            schema=schema,
+            initial_params=initial_params,
+            helper_text=self._operation_helper_text(display_name),
+            parent=self,
+        )
+
     def _edit_operation_params(
         self,
         display_name: str,
@@ -521,13 +580,9 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> dict | None:
         if self.current_engine is None:
             raise ValueError("Load a document before configuring operations.")
-        schema = OperationRegistry.get(display_name).operation_cls.params_schema
-        dialog = OperationParamsDialog(
-            operation_name=display_name,
-            schema=schema,
-            initial_params=initial_params or self._build_operation_template(display_name),
-            helper_text=self._operation_helper_text(display_name),
-            parent=self,
+        dialog = self._build_operation_dialog(
+            display_name,
+            initial_params or self._build_operation_template(display_name),
         )
         while dialog.exec_() == QtWidgets.QDialog.Accepted:
             try:
@@ -553,15 +608,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 "No operations are available for the currently loaded engine.",
             )
             return
-        display_name, ok = QtWidgets.QInputDialog.getItem(
-            self,
-            "Add Operation",
-            "Operation type:",
-            available,
-            0,
-            False,
+        required_capabilities_by_name = {
+            name: sorted(OperationRegistry.get(name).operation_cls.required_capabilities)
+            for name in available
+        }
+        picker = OperationPickerDialog(
+            available_operations=available,
+            required_capabilities_by_name=required_capabilities_by_name,
+            parent=self,
         )
-        if not ok or not display_name:
+        if picker.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        display_name = picker.selected_operation_name()
+        if not display_name:
             return
         params = self._edit_operation_params(display_name)
         if params is None:
